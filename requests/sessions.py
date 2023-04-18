@@ -9,10 +9,11 @@ import os
 import sys
 import time
 from collections import OrderedDict
+from contextlib import contextmanager
 from datetime import timedelta
 
 from ._internal_utils import to_native_string
-from .adapters import HTTPAdapter
+from .adapters import HTTPAdapter, UploadWriter
 from .auth import _basic_auth_str
 from .compat import Mapping, cookielib, urljoin, urlparse
 from .cookies import (
@@ -352,6 +353,36 @@ class SessionRedirectMixin:
         prepared_request.method = method
 
 
+class SessionUploadWriter:
+    def __init__(self, ctx):
+        self._ctx = ctx
+        self._writer = None
+        self._result = None
+
+    @property
+    def result(self):
+        return self._result
+
+    def open(self):
+        self._writer = self._ctx.__enter__()
+
+    def write(self, data):
+        self._writer.write(data)
+
+    def close(self):
+        self._ctx.__exit__(None, None, None)
+        self._result = self._writer.result
+        self._writer = None
+        return self._result
+
+    def __enter__(self):
+        self.open()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+
 class Session(SessionRedirectMixin):
     """A Requests session.
 
@@ -384,6 +415,7 @@ class Session(SessionRedirectMixin):
         "stream",
         "trust_env",
         "max_redirects",
+        "file_upload",
     ]
 
     def __init__(self):
@@ -442,6 +474,9 @@ class Session(SessionRedirectMixin):
         #: :class:`RequestsCookieJar <requests.cookies.RequestsCookieJar>`, but
         #: may be any other ``cookielib.CookieJar`` compatible object.
         self.cookies = cookiejar_from_dict({})
+
+        #: Serve uploads as file-like objects
+        self.file_upload = False
 
         # Default connection adapters.
         self.adapters = OrderedDict()
@@ -515,6 +550,7 @@ class Session(SessionRedirectMixin):
         verify=None,
         cert=None,
         json=None,
+        file_upload=None,
     ):
         """Constructs a :class:`Request <Request>`, prepares it and sends it.
         Returns :class:`Response <Response>` object.
@@ -545,6 +581,7 @@ class Session(SessionRedirectMixin):
             hostname to the URL of the proxy.
         :param stream: (optional) whether to immediately download the response
             content. Defaults to ``False``.
+        :param file_upload: (optional) whether to provide uploading as file-like objects
         :param verify: (optional) Either a boolean, in which case it controls whether we verify
             the server's TLS certificate, or a string, in which case it must be a path
             to a CA bundle to use. Defaults to ``True``. When set to
@@ -558,12 +595,17 @@ class Session(SessionRedirectMixin):
         :rtype: requests.Response
         """
         # Create the Request.
+        if file_upload:
+            data = (None for _ in range(0))
+        else:
+            data = data or {}
+
         req = Request(
             method=method.upper(),
             url=url,
             headers=headers,
             files=files,
-            data=data or {},
+            data=data,
             json=json,
             params=params or {},
             auth=auth,
@@ -575,7 +617,7 @@ class Session(SessionRedirectMixin):
         proxies = proxies or {}
 
         settings = self.merge_environment_settings(
-            prep.url, proxies, stream, verify, cert
+            prep.url, proxies, stream, verify, cert, file_upload
         )
 
         # Send the request.
@@ -669,15 +711,31 @@ class Session(SessionRedirectMixin):
         return self.request("DELETE", url, **kwargs)
 
     def send(self, request, **kwargs):
+        kwargs.setdefault("file_upload", self.file_upload)
+        file_upload = kwargs.get("file_upload")
+
+    def send(self, request, **kwargs):
         """Send a given PreparedRequest.
 
         :rtype: requests.Response
         """
+        kwargs.setdefault("file_upload", self.file_upload)
+        file_upload = kwargs.get("file_upload")
+        if not file_upload:
+            with self._send(request, **kwargs) as r:
+                pass
+            return r.result
+        else:
+            return SessionUploadWriter(self._send(request, **kwargs))
+
+    @contextmanager
+    def _send(self, request, **kwargs):
         # Set defaults that the hooks can utilize to ensure they always have
         # the correct parameters to reproduce the previous request.
         kwargs.setdefault("stream", self.stream)
         kwargs.setdefault("verify", self.verify)
         kwargs.setdefault("cert", self.cert)
+        kwargs.setdefault("file_upload", self.file_upload)
         if "proxies" not in kwargs:
             kwargs["proxies"] = resolve_proxies(request, self.proxies, self.trust_env)
 
@@ -689,6 +747,7 @@ class Session(SessionRedirectMixin):
         # Set up variables needed for resolve_redirects and dispatching of hooks
         allow_redirects = kwargs.pop("allow_redirects", True)
         stream = kwargs.get("stream")
+        file_upload = kwargs.get("file_upload")
         hooks = request.hooks
 
         # Get the appropriate adapter to use
@@ -698,7 +757,14 @@ class Session(SessionRedirectMixin):
         start = preferred_clock()
 
         # Send the request
-        r = adapter.send(request, **kwargs)
+        if file_upload:
+            with adapter.send_with_fileio(request, **kwargs) as writer:
+                yield writer
+            r = writer.result
+        else:
+            writer = UploadWriter(None)
+            r = adapter.send(request, **kwargs)
+            yield writer
 
         # Total elapsed time of the request (approximately)
         elapsed = preferred_clock() - start
@@ -744,9 +810,9 @@ class Session(SessionRedirectMixin):
         if not stream:
             r.content
 
-        return r
+        writer.result = r
 
-    def merge_environment_settings(self, url, proxies, stream, verify, cert):
+    def merge_environment_settings(self, url, proxies, stream, verify, cert, file_upload):
         """
         Check the environment and merge it with some settings.
 
@@ -774,8 +840,15 @@ class Session(SessionRedirectMixin):
         stream = merge_setting(stream, self.stream)
         verify = merge_setting(verify, self.verify)
         cert = merge_setting(cert, self.cert)
+        file_upload = merge_setting(file_upload, self.file_upload)
 
-        return {"proxies": proxies, "stream": stream, "verify": verify, "cert": cert}
+        return {
+            "proxies": proxies,
+            "stream": stream,
+            "verify": verify,
+            "cert": cert,
+            "file_upload": file_upload,
+        }
 
     def get_adapter(self, url):
         """

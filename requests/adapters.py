@@ -8,6 +8,7 @@ and maintain connections.
 
 import os.path
 import socket  # noqa: F401
+from contextlib import contextmanager
 
 from urllib3.exceptions import ClosedPoolError, ConnectTimeoutError
 from urllib3.exceptions import HTTPError as _HTTPError
@@ -75,7 +76,14 @@ class BaseAdapter:
         super().__init__()
 
     def send(
-        self, request, stream=False, timeout=None, verify=True, cert=None, proxies=None
+        self,
+        request,
+        stream=False,
+        timeout=None,
+        verify=True,
+        cert=None,
+        proxies=None,
+        file_upload=False,
     ):
         """Sends PreparedRequest object. Returns Response object.
 
@@ -93,9 +101,37 @@ class BaseAdapter:
         """
         raise NotImplementedError
 
+    def send_with_fileio(
+        self,
+        request,
+        stream=False,
+        timeout=None,
+        verify=True,
+        cert=None,
+        proxies=None,
+        file_upload=False,
+    ):
+        raise NotImplementedError
+
     def close(self):
         """Cleans up adapter specific items."""
         raise NotImplementedError
+
+
+class UploadWriter:
+    def __init__(self, low_conn):
+        self._low_conn = low_conn
+        self.result = None
+
+    @property
+    def has_conn(self):
+        return self._low_conn is not None
+
+    def write(self, chunk):
+        self._low_conn.send(hex(len(chunk))[2:].encode("utf-8"))
+        self._low_conn.send(b"\r\n")
+        self._low_conn.send(chunk)
+        self._low_conn.send(b"\r\n")
 
 
 class HTTPAdapter(BaseAdapter):
@@ -434,7 +470,14 @@ class HTTPAdapter(BaseAdapter):
         return headers
 
     def send(
-        self, request, stream=False, timeout=None, verify=True, cert=None, proxies=None
+        self,
+        request,
+        stream=False,
+        timeout=None,
+        verify=True,
+        cert=None,
+        proxies=None,
+        file_upload=False,
     ):
         """Sends PreparedRequest object. Returns Response object.
 
@@ -451,7 +494,31 @@ class HTTPAdapter(BaseAdapter):
         :param proxies: (optional) The proxies dictionary to apply to the request.
         :rtype: requests.Response
         """
+        with self.send_with_fileio(
+            request,
+            stream=stream,
+            timeout=timeout,
+            verify=verify,
+            cert=cert,
+            proxies=proxies,
+            file_upload=file_upload,
+        ) as writer:
+            if writer.has_conn:
+                for i in request.body:
+                    writer.write(i)
+        return writer.result
 
+    @contextmanager
+    def send_with_fileio(
+        self,
+        request,
+        stream=False,
+        timeout=None,
+        verify=True,
+        cert=None,
+        proxies=None,
+        file_upload=False,
+    ):
         try:
             conn = self.get_connection(request.url, proxies)
         except LocationValueError as e:
@@ -468,7 +535,7 @@ class HTTPAdapter(BaseAdapter):
             proxies=proxies,
         )
 
-        chunked = not (request.body is None or "Content-Length" in request.headers)
+        chunked = not (request.body is None or "Content-Length" in request.headers) or file_upload
 
         if isinstance(timeout, tuple):
             try:
@@ -498,6 +565,8 @@ class HTTPAdapter(BaseAdapter):
                     retries=self.max_retries,
                     timeout=timeout,
                 )
+                writer = UploadWriter(None)
+                yield writer
 
             # Send the request.
             else:
@@ -520,11 +589,8 @@ class HTTPAdapter(BaseAdapter):
 
                     low_conn.endheaders()
 
-                    for i in request.body:
-                        low_conn.send(hex(len(i))[2:].encode("utf-8"))
-                        low_conn.send(b"\r\n")
-                        low_conn.send(i)
-                        low_conn.send(b"\r\n")
+                    writer = UploadWriter(low_conn)
+                    yield writer
                     low_conn.send(b"0\r\n\r\n")
 
                     # Receive the response from the server
@@ -581,4 +647,4 @@ class HTTPAdapter(BaseAdapter):
             else:
                 raise
 
-        return self.build_response(request, resp)
+        writer.result = self.build_response(request, resp)

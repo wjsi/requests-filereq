@@ -36,6 +36,23 @@ def test_chunked_upload():
     assert r.request.headers["Transfer-Encoding"] == "chunked"
 
 
+def test_file_upload():
+    """can safely send via file writers"""
+    close_server = threading.Event()
+    server = Server.basic_response_server(wait_to_close_event=close_server)
+
+    with server as (host, port):
+        url = f"http://{host}:{port}/"
+        with requests.post(url, file_upload=True, stream=True) as file:
+            file.write(b"abc")
+            file.write(b"def")
+        r = file.result
+        close_server.set()  # release server block
+
+    assert r.status_code == 200
+    assert r.request.headers["Transfer-Encoding"] == "chunked"
+
+
 def test_chunked_encoding_error():
     """get a ChunkedEncodingError if the server returns a bad response"""
 
